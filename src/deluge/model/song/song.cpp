@@ -162,6 +162,9 @@ Song::Song() : backedUpParamManagers(sizeof(BackedUpParamManager)) {
 
 	songViewYScroll = 1 - kDisplayHeight;
 	arrangementYScroll = -kDisplayHeight;
+	aiLoopSections = false;
+	aiLoopSectionStart = 0;
+	aiLoopSectionEnd = 0;
 
 	anyClipsSoloing = false;
 	anyOutputsSoloingInArrangement = false;

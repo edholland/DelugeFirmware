@@ -235,6 +235,9 @@ public:
 	int32_t arrangementYScroll;
 
 	uint8_t sectionToReturnToAfterSongEnd;
+	bool aiLoopSections;
+	uint8_t aiLoopSectionStart;
+	uint8_t aiLoopSectionEnd;
 
 	bool wasLastInArrangementEditor;
 	int32_t lastClipInstanceEnteredStartPos; // -1 means we are not "inside" an arrangement. While we're in the

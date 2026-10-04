@@ -177,6 +177,13 @@ void Session::armNextSection(int32_t oldSection, int32_t numRepetitions) {
 	}
 
 	// If we're here, that was the last section
+	if (currentSong->aiLoopSections && oldSection == currentSong->aiLoopSectionEnd
+	    && currentSong->aiLoopSectionStart < kMaxNumSections) {
+		userWantsToArmClipsToStartOrSolo(currentSong->aiLoopSectionStart, nullptr, true, false, false, numRepetitions,
+		                                 false);
+		lastSectionArmed = currentSong->aiLoopSectionStart;
+		return;
+	}
 	armAllClipsToStop(numRepetitions);
 	lastSectionArmed = SECTION_OUT_OF_RANGE;
 }
