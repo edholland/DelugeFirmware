@@ -153,10 +153,6 @@ def load_fw(output, handshake, file, delay_ms=2, output_to_file=False):
         with output:
             for msg in util.progressbar(sysex_data, "Firmware Upload: "):
                 output.send_message(msg)
-                # NOTE: these two sleeps are mathematically identical
-                # (delay_ms/1000 == 0.001*delay_ms); the second is a suspected
-                # stray duplicate. Intentionally left as-is pending confirmation.
-                time.sleep(delay_ms / 1000)
                 time.sleep(0.001 * delay_ms)
 
 
