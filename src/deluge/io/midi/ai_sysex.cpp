@@ -54,6 +54,7 @@ enum Command : uint8_t {
 	SET_SIDECHAIN = 18,
 	SAVE_SONG = 19,
 	LOAD_SONG = 20,
+	ARM_SECTION = 21,
 };
 
 enum Status : uint8_t {
@@ -1411,6 +1412,51 @@ Status saveSong(uint8_t* data, int32_t len) {
 	return OK;
 }
 
+Status armSection(uint8_t* data, int32_t len) {
+	// Payload after the AI namespace command:
+	//   0: subcommand = ARM_SECTION
+	//   1: the section that should play when play is pressed
+	//   2: the section empty clips (e.g. a template's) are parked in
+	// Every empty session clip moves to the park section and goes inactive;
+	// every other clip is made active exactly when it belongs to the start
+	// section. Saved after this, a song starts its music on bar one instead
+	// of on the template's empty clips. Refused with BUSY during playback.
+	if (len < 3) {
+		return BAD_LENGTH;
+	}
+	if (!currentSong) {
+		return NO_SONG;
+	}
+	if (playbackHandler.isEitherClockActive()) {
+		return BUSY;
+	}
+	uint8_t start = data[1] & 0x7f;
+	uint8_t park = data[2] & 0x7f;
+	if (start >= kMaxNumSections || park >= kMaxNumSections) {
+		return BAD_PARAM;
+	}
+	int32_t armed = 0;
+	for (int32_t c = 0; c < currentSong->sessionClips.getNumElements(); c++) {
+		Clip* clip = currentSong->sessionClips.getClipAtIndex(c);
+		if (!clip) {
+			continue;
+		}
+		if (clip->isEmpty(false)) {
+			clip->section = park;
+			clip->activeIfNoSolo = false;
+			continue;
+		}
+		clip->activeIfNoSolo = (clip->section == start);
+		if (clip->activeIfNoSolo) {
+			armed++;
+		}
+	}
+	if (getRootUI()) {
+		uiNeedsRendering(getRootUI(), 0xFFFFFFFF, 0);
+	}
+	return armed ? OK : NO_CLIP;
+}
+
 Status loadSong(uint8_t* data, int32_t len) {
 	// Payload after the AI namespace command:
 	//   0: subcommand = LOAD_SONG
@@ -1535,6 +1581,9 @@ void AISysex::sysexReceived(MIDICable& cable, uint8_t* data, int32_t len) {
 		break;
 	case LOAD_SONG:
 		status = loadSong(data, len);
+		break;
+	case ARM_SECTION:
+		status = armSection(data, len);
 		break;
 	default:
 		status = BAD_LENGTH;
