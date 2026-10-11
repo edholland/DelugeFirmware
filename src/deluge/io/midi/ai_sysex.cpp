@@ -1,28 +1,33 @@
 #include "io/midi/ai_sysex.h"
 #include "definitions_cxx.hpp"
+#include "fatfs/ff.h"
 #include "gui/ui/load/load_instrument_preset_ui.h"
+#include "gui/ui/load/load_song_ui.h"
 #include "gui/ui/ui.h"
 #include "gui/views/instrument_clip_view.h"
 #include "gui/views/session_view.h"
 #include "io/midi/midi_device.h"
 #include "io/midi/sysex.h"
 #include "memory/general_memory_allocator.h"
-#include "modulation/automation/auto_param.h"
-#include "modulation/params/param_manager.h"
-#include "modulation/params/param.h"
-#include "modulation/params/param_set.h"
-#include "modulation/patch/patch_cable_set.h"
 #include "model/clip/clip.h"
 #include "model/clip/instrument_clip.h"
 #include "model/instrument/kit.h"
 #include "model/model_stack.h"
 #include "model/note/note_row.h"
 #include "model/output.h"
+#include "model/sample/sample.h"
 #include "model/song/song.h"
+#include "modulation/automation/auto_param.h"
+#include "modulation/params/param.h"
+#include "modulation/params/param_manager.h"
+#include "modulation/params/param_set.h"
+#include "modulation/patch/patch_cable_set.h"
 #include "playback/mode/session.h"
+#include "playback/playback_handler.h"
 #include "processing/engines/audio_engine.h"
 #include "processing/sound/sound_drum.h"
 #include "processing/sound/sound_instrument.h"
+#include "storage/audio/audio_file_manager.h"
 #include "storage/storage_manager.h"
 
 namespace {
@@ -47,6 +52,8 @@ enum Command : uint8_t {
 	CLAMP_SESSION_VISIBLE_LENGTH = 16,
 	SET_SECTION_REPEAT = 17,
 	SET_SIDECHAIN = 18,
+	SAVE_SONG = 19,
+	LOAD_SONG = 20,
 };
 
 enum Status : uint8_t {
@@ -63,6 +70,9 @@ enum Status : uint8_t {
 	BAD_PARAM = 10,
 	SD_CARD_UNAVAILABLE = 11,
 	FILE_NOT_FOUND = 12,
+	FILE_EXISTS = 13,
+	BUSY = 14,
+	NEEDS_UI_SAVE = 15,
 };
 
 uint16_t read14(uint8_t msb, uint8_t lsb) {
@@ -384,10 +394,11 @@ Status loadCurrentSynthPreset(uint8_t* data, int32_t len) {
 
 	char filename[69];
 	int32_t extensionStart = nameLength - 4;
-	bool hasXmlExtension = extensionStart >= 0 && (presetNameChars[extensionStart] == '.')
-	                       && (presetNameChars[extensionStart + 1] == 'X' || presetNameChars[extensionStart + 1] == 'x')
-	                       && (presetNameChars[extensionStart + 2] == 'M' || presetNameChars[extensionStart + 2] == 'm')
-	                       && (presetNameChars[extensionStart + 3] == 'L' || presetNameChars[extensionStart + 3] == 'l');
+	bool hasXmlExtension =
+	    extensionStart >= 0 && (presetNameChars[extensionStart] == '.')
+	    && (presetNameChars[extensionStart + 1] == 'X' || presetNameChars[extensionStart + 1] == 'x')
+	    && (presetNameChars[extensionStart + 2] == 'M' || presetNameChars[extensionStart + 2] == 'm')
+	    && (presetNameChars[extensionStart + 3] == 'L' || presetNameChars[extensionStart + 3] == 'l');
 	if (hasXmlExtension) {
 		snprintf(filename, sizeof(filename), "%s", presetNameChars);
 		presetNameChars[extensionStart] = 0;
@@ -437,10 +448,9 @@ Status loadCurrentSynthPreset(uint8_t* data, int32_t len) {
 	}
 
 	char modelStackMemory[MODEL_STACK_MAX_SIZE];
-	ModelStackWithTimelineCounter* modelStack =
-	    setupModelStackWithTimelineCounter(modelStackMemory, currentSong, clip);
-	error = clip->changeInstrument(modelStack, newInstrument, nullptr,
-	                               InstrumentRemoval::DELETE_OR_HIBERNATE_IF_UNUSED, nullptr, true);
+	ModelStackWithTimelineCounter* modelStack = setupModelStackWithTimelineCounter(modelStackMemory, currentSong, clip);
+	error = clip->changeInstrument(modelStack, newInstrument, nullptr, InstrumentRemoval::DELETE_OR_HIBERNATE_IF_UNUSED,
+	                               nullptr, true);
 	if (error != Error::NONE) {
 		return ACTION_FAILED;
 	}
@@ -697,7 +707,8 @@ Status selectSessionIndex(uint8_t* data, int32_t len) {
 	return OK;
 }
 
-Status cloneSessionInternal(int32_t sourceIndex, int32_t destIndex, uint8_t section, bool hasSection, int32_t loopLength) {
+Status cloneSessionInternal(int32_t sourceIndex, int32_t destIndex, uint8_t section, bool hasSection,
+                            int32_t loopLength) {
 	int32_t numClips = currentSong->sessionClips.getNumElements();
 	if (sourceIndex < 0 || sourceIndex >= numClips) {
 		return NO_CLIP;
@@ -860,8 +871,7 @@ Status createBlankSynthSessionIndex(int32_t destIndex, uint8_t section, int32_t 
 
 	currentSong->setCurrentClip(clip);
 	char modelStackMemory[MODEL_STACK_MAX_SIZE];
-	ModelStackWithTimelineCounter* modelStack =
-	    setupModelStackWithTimelineCounter(modelStackMemory, currentSong, clip);
+	ModelStackWithTimelineCounter* modelStack = setupModelStackWithTimelineCounter(modelStackMemory, currentSong, clip);
 	clip->output->setActiveClip(modelStack);
 
 	return OK;
@@ -1004,7 +1014,7 @@ Status setRowExpression(uint8_t* data, int32_t len) {
 	AutoParam* param = &expressionParams->params[dimension];
 	ModelStackWithAutoParam* modelStackWithAutoParam =
 	    modelStackWithNoteRow->addOtherTwoThingsAutomaticallyGivenNoteRow()->addParam(expressionParams, summary,
-	                                                                                 dimension, param);
+	                                                                                  dimension, param);
 
 	param->setValueForRegion(pos, length, value14ToBig(value14), modelStackWithAutoParam);
 
@@ -1157,8 +1167,8 @@ Status setClipParamAutomation(uint8_t* data, int32_t len) {
 		if (param->setNodeAtPos(pos, startValue, true) == -1 || param->setNodeAtPos(endPos, endValue, true) == -1) {
 			return ACTION_FAILED;
 		}
-		modelStackWithAutoParam->paramCollection->notifyParamModifiedInSomeWay(
-		    modelStackWithAutoParam, oldValue, true, automatedBefore, param->isAutomated());
+		modelStackWithAutoParam->paramCollection->notifyParamModifiedInSomeWay(modelStackWithAutoParam, oldValue, true,
+		                                                                       automatedBefore, param->isAutomated());
 	}
 	else {
 		return BAD_PARAM;
@@ -1260,7 +1270,8 @@ Status setSidechain(uint8_t* data, int32_t len) {
 		    modelStack->addOtherTwoThingsButNoNoteRow(clip->output->toModControllable(), &clip->paramManager);
 
 		if (clip->paramManager.containsAnyMainParamCollections()) {
-			clip->paramManager.getUnpatchedParamSet()->params[params::UNPATCHED_SIDECHAIN_VOLUME]
+			clip->paramManager.getUnpatchedParamSet()
+			    ->params[params::UNPATCHED_SIDECHAIN_VOLUME]
 			    .setCurrentValueBasicForSetup(amount);
 		}
 
@@ -1270,8 +1281,8 @@ Status setSidechain(uint8_t* data, int32_t len) {
 			destination.setToHaveParamOnly(params::GLOBAL_VOLUME_POST_REVERB_SEND);
 			ModelStackWithParamCollection* modelStackWithPatchCableSet =
 			    clip->paramManager.getPatchCableSet(modelStackWithThreeMainThings);
-			uint8_t cableIndex =
-			    patchCableSet->getPatchCableIndex(PatchSource::SIDECHAIN, destination, modelStackWithPatchCableSet, true);
+			uint8_t cableIndex = patchCableSet->getPatchCableIndex(PatchSource::SIDECHAIN, destination,
+			                                                       modelStackWithPatchCableSet, true);
 			if (cableIndex == 255) {
 				return ACTION_FAILED;
 			}
@@ -1286,6 +1297,159 @@ Status setSidechain(uint8_t* data, int32_t len) {
 	clip->expectEvent();
 	if (getRootUI()) {
 		uiNeedsRendering(getRootUI(), 0xFFFFFFFF, 0);
+	}
+	return OK;
+}
+
+// Song names over SysEx: 7-bit ASCII, letters/digits/space/-/_ kept, anything
+// else becomes '_'. Returns false for an empty or too-long name.
+bool readSongName(uint8_t* data, int32_t len, int32_t from, char* out, int32_t outSize) {
+	int32_t n = 0;
+	for (int32_t i = from; i < len && data[i] != 0; i++) {
+		if (n >= outSize - 1) {
+			return false;
+		}
+		char c = (char)(data[i] & 0x7f);
+		bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == ' ' || c == '-'
+		          || c == '_';
+		out[n++] = ok ? c : '_';
+	}
+	out[n] = 0;
+	return n > 0;
+}
+
+Status songPath(String& path, char const* name) {
+	if (path.set("SONGS/") != Error::NONE || path.concatenate(name) != Error::NONE
+	    || path.concatenate(".XML") != Error::NONE) {
+		return ACTION_FAILED;
+	}
+	return OK;
+}
+
+Status saveSong(uint8_t* data, int32_t len) {
+	// Payload after the AI namespace command:
+	//   0: subcommand = SAVE_SONG
+	//   1: flags, bit 0 = may overwrite an existing song of that name
+	//   2..: song name, 7-bit ASCII (saved as SONGS/<name>.XML)
+	// The headless core of SaveSongUI::performSave: the song file is written
+	// with the firmware's own serializer, to a temp file first when it would
+	// overwrite. Songs whose samples would need copying (an unsaved recording,
+	// or samples loaded from a "collected" song folder) are refused with
+	// NEEDS_UI_SAVE - save those once from the Deluge's own Save menu.
+	if (len < 3) {
+		return BAD_LENGTH;
+	}
+	if (!currentSong) {
+		return NO_SONG;
+	}
+	bool mayOverwrite = data[1] & 0x01;
+	char name[64];
+	if (!readSongName(data, len, 2, name, sizeof(name))) {
+		return BAD_PARAM;
+	}
+	if (currentSong->hasAnyPendingNextOverdubs()) {
+		return BUSY;
+	}
+	for (int32_t i = 0; i < audioFileManager.audioFiles.getNumElements(); i++) {
+		AudioFile* audioFile = (AudioFile*)audioFileManager.audioFiles.getElement(i);
+		if (!audioFile->numReasonsToBeLoaded) {
+			continue;
+		}
+		if (!audioFile->loadedFromAlternatePath.isEmpty()) {
+			return NEEDS_UI_SAVE;
+		}
+		if (audioFile->type == AudioFileType::SAMPLE && !((Sample*)audioFile)->tempFilePathForRecording.isEmpty()) {
+			return NEEDS_UI_SAVE;
+		}
+	}
+
+	String filePath;
+	if (songPath(filePath, name) != OK) {
+		return ACTION_FAILED;
+	}
+	bool existed = StorageManager::fileExists(filePath.get());
+	if (existed && !mayOverwrite) {
+		return FILE_EXISTS;
+	}
+
+	String writePath;
+	if (existed) {
+		for (int32_t n = 0;; n++) {
+			if (writePath.set("SONGS/TEMP") != Error::NONE || writePath.concatenateInt(n, 4) != Error::NONE
+			    || writePath.concatenate(".XML") != Error::NONE) {
+				return ACTION_FAILED;
+			}
+			if (!StorageManager::fileExists(writePath.get())) {
+				break;
+			}
+		}
+	}
+	else {
+		writePath.set(&filePath);
+	}
+
+	if (StorageManager::createXMLFile(writePath.get(), smSerializer, false, false) != Error::NONE) {
+		return SD_CARD_UNAVAILABLE;
+	}
+	currentSong->writeToFile();
+	if (GetSerializer().closeFileAfterWriting(writePath.get(), "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<song\n",
+	                                          "\n</song>\n")
+	    != Error::NONE) {
+		return ACTION_FAILED;
+	}
+	if (existed) {
+		if (f_unlink(filePath.get()) != FR_OK || f_rename(writePath.get(), filePath.get()) != FR_OK) {
+			return ACTION_FAILED;
+		}
+	}
+
+	currentSong->name.set(name);
+	currentSong->dirPath.set("SONGS");
+	if (getRootUI()) {
+		uiNeedsRendering(getRootUI(), 0xFFFFFFFF, 0);
+	}
+	return OK;
+}
+
+Status loadSong(uint8_t* data, int32_t len) {
+	// Payload after the AI namespace command:
+	//   0: subcommand = LOAD_SONG
+	//   1..: song name, 7-bit ASCII (loads SONGS/<name>.XML)
+	// The same path the firmware takes for its startup song: point the song
+	// at the file, open the load UI and perform the load. Refused with BUSY
+	// while the transport runs (that path loads two songs at once) or while
+	// a menu or browser is open - stop playback and return to a main view.
+	if (len < 2) {
+		return BAD_LENGTH;
+	}
+	if (!currentSong) {
+		return NO_SONG;
+	}
+	char name[64];
+	if (!readSongName(data, len, 1, name, sizeof(name))) {
+		return BAD_PARAM;
+	}
+	String filePath;
+	if (songPath(filePath, name) != OK) {
+		return ACTION_FAILED;
+	}
+	if (!StorageManager::fileExists(filePath.get())) {
+		return FILE_NOT_FOUND;
+	}
+	if (playbackHandler.isEitherClockActive() || getCurrentUI() != getRootUI()) {
+		return BUSY;
+	}
+
+	currentSong->setSongFullPath(filePath.get());
+	if (!openUI(&loadSongUI)) {
+		return ACTION_FAILED;
+	}
+	loadSongUI.performLoad();
+
+	String wanted;
+	wanted.set(name);
+	if (!currentSong || !currentSong->name.equalsCaseIrrespective(&wanted)) {
+		return ACTION_FAILED;
 	}
 	return OK;
 }
@@ -1365,6 +1529,12 @@ void AISysex::sysexReceived(MIDICable& cable, uint8_t* data, int32_t len) {
 		break;
 	case SET_SIDECHAIN:
 		status = setSidechain(data, len);
+		break;
+	case SAVE_SONG:
+		status = saveSong(data, len);
+		break;
+	case LOAD_SONG:
+		status = loadSong(data, len);
 		break;
 	default:
 		status = BAD_LENGTH;
