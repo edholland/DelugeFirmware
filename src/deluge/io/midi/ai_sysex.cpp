@@ -55,6 +55,8 @@ enum Command : uint8_t {
 	SAVE_SONG = 19,
 	LOAD_SONG = 20,
 	ARM_SECTION = 21,
+	SET_ROW_PARAM_AUTOMATION = 22,
+	LOAD_CURRENT_KIT_PRESET = 23,
 };
 
 enum Status : uint8_t {
@@ -370,10 +372,10 @@ Status setCurrentClipName(uint8_t* data, int32_t len) {
 	return OK;
 }
 
-Status loadCurrentSynthPreset(uint8_t* data, int32_t len) {
+Status loadCurrentPreset(uint8_t* data, int32_t len, OutputType outputType, char const* presetDir) {
 	// Payload after the AI namespace command:
-	//   0: subcommand = LOAD_CURRENT_SYNTH_PRESET
-	//   1..n: ASCII preset name from SYNTHS, with or without .XML
+	//   0: subcommand = LOAD_CURRENT_SYNTH_PRESET / LOAD_CURRENT_KIT_PRESET
+	//   1..n: ASCII preset name from SYNTHS / KITS, with or without .XML
 	if (len < 2) {
 		return BAD_LENGTH;
 	}
@@ -383,6 +385,11 @@ Status loadCurrentSynthPreset(uint8_t* data, int32_t len) {
 	InstrumentClip* clip = getCurrentInstrumentClip();
 	if (!clip) {
 		return NO_INSTRUMENT_CLIP;
+	}
+	// A kit only replaces a kit and a synth a synth: the clip's notes are rows
+	// in the one and pitches in the other.
+	if (!clip->output || clip->output->type != outputType) {
+		return BAD_PARAM;
 	}
 
 	char presetNameChars[65];
@@ -413,7 +420,7 @@ Status loadCurrentSynthPreset(uint8_t* data, int32_t len) {
 		return SD_CARD_UNAVAILABLE;
 	}
 
-	Error error = Browser::currentDir.set("SYNTHS");
+	Error error = Browser::currentDir.set(presetDir);
 	if (error != Error::NONE) {
 		return ACTION_FAILED;
 	}
@@ -423,7 +430,7 @@ Status loadCurrentSynthPreset(uint8_t* data, int32_t len) {
 		return ACTION_FAILED;
 	}
 	auto presetResult =
-	    loadInstrumentPresetUI.confirmPresetOrNextUnlaunchedOne(OutputType::SYNTH, &searchName, Availability::ANY);
+	    loadInstrumentPresetUI.confirmPresetOrNextUnlaunchedOne(outputType, &searchName, Availability::ANY);
 	if (!presetResult) {
 		return FILE_NOT_FOUND;
 	}
@@ -441,7 +448,7 @@ Status loadCurrentSynthPreset(uint8_t* data, int32_t len) {
 	}
 
 	Instrument* newInstrument = nullptr;
-	error = StorageManager::loadInstrumentFromFile(currentSong, clip, OutputType::SYNTH, false, &newInstrument,
+	error = StorageManager::loadInstrumentFromFile(currentSong, clip, outputType, false, &newInstrument,
 	                                               &presetFile->filePointer, &presetName, &dirPath);
 	Browser::emptyFileItems();
 	if (error != Error::NONE || !newInstrument) {
@@ -462,6 +469,14 @@ Status loadCurrentSynthPreset(uint8_t* data, int32_t len) {
 		uiNeedsRendering(getRootUI(), 0xFFFFFFFF, 0);
 	}
 	return OK;
+}
+
+Status loadCurrentSynthPreset(uint8_t* data, int32_t len) {
+	return loadCurrentPreset(data, len, OutputType::SYNTH, "SYNTHS");
+}
+
+Status loadCurrentKitPreset(uint8_t* data, int32_t len) {
+	return loadCurrentPreset(data, len, OutputType::KIT, "KITS");
 }
 
 Status syncSharedOutputParams(uint8_t* data, int32_t len) {
@@ -1083,89 +1098,131 @@ Status createSessionVisible(uint8_t* data, int32_t len) {
 	return OK;
 }
 
-Status setClipParamAutomation(uint8_t* data, int32_t len) {
-	// Payload after the AI namespace command:
-	//   0: subcommand = SET_CLIP_PARAM_AUTOMATION
-	//   1: param alias: 0 LPF freq, 1 LPF resonance, 2 HPF freq, 3 reverb amount
-	//   2: shape: 0 region / hold start value, 1 ramp start->end
-	//   3-4: start position, 14-bit big endian 7-bit bytes
-	//   5-6: length, 14-bit big endian 7-bit bytes
-	//   7-8: start value, 14-bit unsigned. 0 low, 16383 high.
-	//   9-10: end value, 14-bit unsigned. Used for ramp shape.
-	// Extended timing form:
-	//   3-5: start position, 21-bit big endian 7-bit bytes
-	//   6-8: length, 21-bit big endian 7-bit bytes
-	//   9-10: start value, 14-bit unsigned.
-	//   11-12: end value, 14-bit unsigned.
-	if (len < 11) {
-		return BAD_LENGTH;
-	}
+// Param aliases shared by SET_CLIP_PARAM_AUTOMATION and SET_ROW_PARAM_AUTOMATION.
+// Each resolves per target: a synth clip's sound, a kit's "affect entire"
+// effects, or one kit row's sound.
+enum ParamAlias : uint8_t {
+	ALIAS_LPF_FREQ = 0,
+	ALIAS_LPF_RES = 1,
+	ALIAS_HPF_FREQ = 2,
+	ALIAS_REVERB = 3,
+	ALIAS_DELAY_AMOUNT = 4,
+	ALIAS_VOLUME = 5,
+	ALIAS_PAN = 6,
+	ALIAS_PITCH = 7,
+	ALIAS_DECAY = 8,   // sounds only: envelope 1 decay
+	ALIAS_RELEASE = 9, // sounds only: envelope 1 release
+	ALIAS_DELAY_RATE = 10,
+};
 
-	if (!currentSong) {
-		return NO_SONG;
-	}
-
-	Clip* clip = currentSong->getCurrentClip();
-	if (!clip || !clip->output) {
-		return NO_CLIP;
-	}
-	if (clip->output->type != OutputType::SYNTH) {
-		return BAD_PARAM;
-	}
-
-	uint8_t alias = data[1] & 0x7f;
-	uint8_t shape = data[2] & 0x7f;
-	bool wideTiming = len >= 13;
-	int32_t pos = wideTiming ? read21(data[3], data[4], data[5]) : read14(data[3], data[4]);
-	int32_t length = wideTiming ? read21(data[6], data[7], data[8]) : read14(data[5], data[6]);
-	int32_t startValue = value14ToBig(wideTiming ? read14(data[9], data[10]) : read14(data[7], data[8]));
-	int32_t endValue = value14ToBig(wideTiming ? read14(data[11], data[12]) : read14(data[9], data[10]));
-	if (length <= 0) {
-		return BAD_LENGTH;
-	}
-
+// A Sound's patched param (a synth, or one kit row), or -1.
+int32_t soundParamForAlias(uint8_t alias) {
 	using namespace deluge::modulation;
-	params::Kind paramKind = params::Kind::PATCHED;
-	int32_t paramID = params::LOCAL_LPF_FREQ;
 	switch (alias) {
-	case 0:
-		paramID = params::LOCAL_LPF_FREQ;
-		break;
-	case 1:
-		paramID = params::LOCAL_LPF_RESONANCE;
-		break;
-	case 2:
-		paramID = params::LOCAL_HPF_FREQ;
-		break;
-	case 3:
-		paramID = params::GLOBAL_REVERB_AMOUNT;
-		break;
+	case ALIAS_LPF_FREQ:
+		return params::LOCAL_LPF_FREQ;
+	case ALIAS_LPF_RES:
+		return params::LOCAL_LPF_RESONANCE;
+	case ALIAS_HPF_FREQ:
+		return params::LOCAL_HPF_FREQ;
+	case ALIAS_REVERB:
+		return params::GLOBAL_REVERB_AMOUNT;
+	case ALIAS_DELAY_AMOUNT:
+		return params::GLOBAL_DELAY_FEEDBACK;
+	case ALIAS_VOLUME:
+		return params::GLOBAL_VOLUME_POST_FX;
+	case ALIAS_PAN:
+		return params::LOCAL_PAN;
+	case ALIAS_PITCH:
+		return params::LOCAL_PITCH_ADJUST;
+	case ALIAS_DECAY:
+		return params::LOCAL_ENV_0_DECAY;
+	case ALIAS_RELEASE:
+		return params::LOCAL_ENV_0_RELEASE;
+	case ALIAS_DELAY_RATE:
+		return params::GLOBAL_DELAY_RATE;
 	default:
-		return BAD_PARAM;
+		return -1;
 	}
+}
 
-	char modelStackMemory[MODEL_STACK_MAX_SIZE];
-	ModelStackWithTimelineCounter* modelStack = setupModelStackWithTimelineCounter(modelStackMemory, currentSong, clip);
-	ModelStackWithAutoParam* modelStackWithAutoParam =
-	    clip->output->getModelStackWithParam(modelStack, clip, paramID, paramKind, true, false);
+// A kit's whole-kit ("affect entire") unpatched param, or -1.
+int32_t kitParamForAlias(uint8_t alias) {
+	using namespace deluge::modulation;
+	switch (alias) {
+	case ALIAS_LPF_FREQ:
+		return params::UNPATCHED_LPF_FREQ;
+	case ALIAS_LPF_RES:
+		return params::UNPATCHED_LPF_RES;
+	case ALIAS_HPF_FREQ:
+		return params::UNPATCHED_HPF_FREQ;
+	case ALIAS_REVERB:
+		return params::UNPATCHED_REVERB_SEND_AMOUNT;
+	case ALIAS_DELAY_AMOUNT:
+		return params::UNPATCHED_DELAY_AMOUNT;
+	case ALIAS_VOLUME:
+		return params::UNPATCHED_VOLUME;
+	case ALIAS_PAN:
+		return params::UNPATCHED_PAN;
+	case ALIAS_PITCH:
+		return params::UNPATCHED_PITCH_ADJUST;
+	case ALIAS_DELAY_RATE:
+		return params::UNPATCHED_DELAY_RATE;
+	default:
+		return -1;
+	}
+}
+
+struct AutomationMove {
+	uint8_t shape;
+	int32_t pos;
+	int32_t length;
+	int32_t startValue;
+	int32_t endValue;
+};
+
+// Timing and values from data[from..]: 14-bit (8 bytes) or 21-bit (10 bytes)
+// positions, then two 14-bit values. The wide form is chosen by length.
+Status readAutomationMove(uint8_t* data, int32_t len, int32_t from, uint8_t shape, AutomationMove* move) {
+	bool wideTiming = len >= from + 10;
+	if (len < from + 8) {
+		return BAD_LENGTH;
+	}
+	move->shape = shape;
+	move->pos = wideTiming ? read21(data[from], data[from + 1], data[from + 2]) : read14(data[from], data[from + 1]);
+	move->length = wideTiming ? read21(data[from + 3], data[from + 4], data[from + 5])
+	                          : read14(data[from + 2], data[from + 3]);
+	int32_t v = wideTiming ? from + 6 : from + 4;
+	move->startValue = value14ToBig(read14(data[v], data[v + 1]));
+	move->endValue = value14ToBig(read14(data[v + 2], data[v + 3]));
+	if (move->length <= 0) {
+		return BAD_LENGTH;
+	}
+	return OK;
+}
+
+// Write a hold (shape 0) or a ramp (shape 1) into an automatable param.
+Status applyAutomationMove(Clip* clip, ModelStackWithTimelineCounter* modelStack,
+                           ModelStackWithAutoParam* modelStackWithAutoParam, AutomationMove const& move) {
 	if (!modelStackWithAutoParam || !modelStackWithAutoParam->autoParam || !modelStackWithAutoParam->paramCollection
 	    || !modelStackWithAutoParam->summary) {
 		return BAD_PARAM;
 	}
 
 	AutoParam* param = modelStackWithAutoParam->autoParam;
-	if (shape == 0) {
-		param->setValueForRegion(pos, length, startValue, modelStackWithAutoParam);
+	if (move.shape == 0) {
+		param->setValueForRegion(move.pos, move.length, move.startValue, modelStackWithAutoParam);
 	}
-	else if (shape == 1) {
+	else if (move.shape == 1) {
 		int32_t oldValue = param->getCurrentValue();
 		bool automatedBefore = param->isAutomated();
-		int32_t endPos = pos + length;
+		int32_t endPos = move.pos + move.length;
 		if (clip->loopLength > 0 && endPos >= clip->loopLength) {
 			endPos = clip->loopLength - 1;
 		}
-		param->deleteNodesWithinRegion(modelStackWithAutoParam, pos, length);
-		if (param->setNodeAtPos(pos, startValue, true) == -1 || param->setNodeAtPos(endPos, endValue, true) == -1) {
+		param->deleteNodesWithinRegion(modelStackWithAutoParam, move.pos, move.length);
+		if (param->setNodeAtPos(move.pos, move.startValue, true) == -1
+		    || param->setNodeAtPos(endPos, move.endValue, true) == -1) {
 			return ACTION_FAILED;
 		}
 		modelStackWithAutoParam->paramCollection->notifyParamModifiedInSomeWay(modelStackWithAutoParam, oldValue, true,
@@ -1179,8 +1236,127 @@ Status setClipParamAutomation(uint8_t* data, int32_t len) {
 	if (getRootUI()) {
 		uiNeedsRendering(getRootUI(), 0xFFFFFFFF, 0);
 	}
-
 	return OK;
+}
+
+Status setClipParamAutomation(uint8_t* data, int32_t len) {
+	// Payload after the AI namespace command:
+	//   0: subcommand = SET_CLIP_PARAM_AUTOMATION
+	//   1: param alias (ParamAlias): 0 LPF freq, 1 LPF res, 2 HPF freq, 3 reverb,
+	//      4 delay amount, 5 volume, 6 pan, 7 pitch, 8 decay, 9 release, 10 delay rate
+	//   2: shape: 0 region / hold start value, 1 ramp start->end
+	//   3-4: start position, 14-bit big endian 7-bit bytes
+	//   5-6: length, 14-bit big endian 7-bit bytes
+	//   7-8: start value, 14-bit unsigned. 0 low, 16383 high.
+	//   9-10: end value, 14-bit unsigned. Used for ramp shape.
+	// Extended timing form:
+	//   3-5: start position, 21-bit big endian 7-bit bytes
+	//   6-8: length, 21-bit big endian 7-bit bytes
+	//   9-10: start value, 14-bit unsigned.
+	//   11-12: end value, 14-bit unsigned.
+	// On a synth clip this automates the synth; on a kit clip, the whole kit
+	// (its "affect entire" effects - decay and release have no kit-wide form).
+	if (len < 11) {
+		return BAD_LENGTH;
+	}
+
+	if (!currentSong) {
+		return NO_SONG;
+	}
+
+	Clip* clip = currentSong->getCurrentClip();
+	if (!clip || !clip->output) {
+		return NO_CLIP;
+	}
+
+	using namespace deluge::modulation;
+	uint8_t alias = data[1] & 0x7f;
+	params::Kind paramKind;
+	int32_t paramID;
+	if (clip->output->type == OutputType::SYNTH) {
+		paramKind = params::Kind::PATCHED;
+		paramID = soundParamForAlias(alias);
+	}
+	else if (clip->output->type == OutputType::KIT) {
+		paramKind = params::Kind::UNPATCHED_GLOBAL;
+		paramID = kitParamForAlias(alias);
+	}
+	else {
+		return BAD_PARAM;
+	}
+	if (paramID < 0) {
+		return BAD_PARAM;
+	}
+
+	AutomationMove move;
+	Status status = readAutomationMove(data, len, 3, data[2] & 0x7f, &move);
+	if (status != OK) {
+		return status;
+	}
+
+	char modelStackMemory[MODEL_STACK_MAX_SIZE];
+	ModelStackWithTimelineCounter* modelStack = setupModelStackWithTimelineCounter(modelStackMemory, currentSong, clip);
+	ModelStackWithAutoParam* modelStackWithAutoParam =
+	    clip->output->getModelStackWithParam(modelStack, clip, paramID, paramKind, true, false);
+	return applyAutomationMove(clip, modelStack, modelStackWithAutoParam, move);
+}
+
+Status setRowParamAutomation(uint8_t* data, int32_t len) {
+	// Payload after the AI namespace command:
+	//   0: subcommand = SET_ROW_PARAM_AUTOMATION
+	//   1: kit row as a MIDI note. Note 36 is the bottom kit row, as in AI note writing.
+	//   2: param alias (ParamAlias, as SET_CLIP_PARAM_AUTOMATION)
+	//   3: shape: 0 region / hold start value, 1 ramp start->end
+	//   4-5: start position, 14-bit; 6-7: length, 14-bit; 8-9 start value; 10-11 end value.
+	// Extended timing form:
+	//   4-6: start position, 21-bit; 7-9: length, 21-bit; 10-11 start value; 12-13 end value.
+	// Automates one drum of the current kit clip: its own filters, sends,
+	// level, pan, pitch and envelope - per hit, as a desk channel would.
+	if (len < 12) {
+		return BAD_LENGTH;
+	}
+	if (!currentSong) {
+		return NO_SONG;
+	}
+	InstrumentClip* clip = getCurrentInstrumentClip();
+	if (!clip || !clip->output) {
+		return NO_INSTRUMENT_CLIP;
+	}
+	if (clip->output->type != OutputType::KIT) {
+		return BAD_PARAM;
+	}
+
+	int32_t paramID = soundParamForAlias(data[2] & 0x7f);
+	if (paramID < 0) {
+		return BAD_PARAM;
+	}
+
+	AutomationMove move;
+	Status status = readAutomationMove(data, len, 4, data[3] & 0x7f, &move);
+	if (status != OK) {
+		return status;
+	}
+
+	char modelStackMemory[MODEL_STACK_MAX_SIZE];
+	ModelStackWithTimelineCounter* modelStack = setupModelStackWithTimelineCounter(modelStackMemory, currentSong, clip);
+	int32_t yDisplay = (data[1] & 0x7f) - 36;
+	ModelStackWithNoteRow* modelStackWithNoteRow = clip->getNoteRowOnScreen(yDisplay, modelStack);
+	if (!modelStackWithNoteRow) {
+		return NO_KIT_ROW;
+	}
+	NoteRow* noteRow = modelStackWithNoteRow->getNoteRowAllowNull();
+	if (!noteRow || !noteRow->drum || noteRow->drum->type != DrumType::SOUND) {
+		return NO_KIT_ROW;
+	}
+
+	ModelStackWithThreeMainThings* modelStackWithThreeMainThings =
+	    modelStackWithNoteRow->addOtherTwoThingsAutomaticallyGivenNoteRow();
+	if (!modelStackWithThreeMainThings) {
+		return NO_KIT_ROW;
+	}
+	ModelStackWithAutoParam* modelStackWithAutoParam =
+	    modelStackWithThreeMainThings->getPatchedAutoParamFromId(paramID);
+	return applyAutomationMove(clip, modelStack, modelStackWithAutoParam, move);
 }
 
 Status setCurrentClipLength(uint8_t* data, int32_t len) {
@@ -1584,6 +1760,12 @@ void AISysex::sysexReceived(MIDICable& cable, uint8_t* data, int32_t len) {
 		break;
 	case ARM_SECTION:
 		status = armSection(data, len);
+		break;
+	case SET_ROW_PARAM_AUTOMATION:
+		status = setRowParamAutomation(data, len);
+		break;
+	case LOAD_CURRENT_KIT_PRESET:
+		status = loadCurrentKitPreset(data, len);
 		break;
 	default:
 		status = BAD_LENGTH;
