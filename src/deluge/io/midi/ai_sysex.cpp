@@ -464,6 +464,11 @@ Status loadCurrentPreset(uint8_t* data, int32_t len, OutputType outputType, char
 	}
 	currentSong->addOutput(newInstrument);
 	clip->output->setActiveClip(modelStack);
+	if (outputType == OutputType::KIT) {
+		// AI note writing finds a kit row as note - 36 + yScroll: start from the
+		// bottom so note 36 is the kit's first drum, whatever the clip showed.
+		clip->yScroll = 0;
+	}
 
 	if (getRootUI()) {
 		uiNeedsRendering(getRootUI(), 0xFFFFFFFF, 0);
