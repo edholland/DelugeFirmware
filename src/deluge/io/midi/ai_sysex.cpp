@@ -124,7 +124,8 @@ void sendReply(MIDICable& cable, uint8_t command, uint8_t status) {
 // all of them). Older builds answer a PING with no version byte at all.
 //   1: ai-kit-automation - kit automation, row automation, kit presets
 //   2: kit/synth presets load by exact path, with their samples
-constexpr uint8_t kAIProtocolVersion = 2;
+//   3: names end at the SysEx end byte (no stray 'w': kits are found)
+constexpr uint8_t kAIProtocolVersion = 3;
 
 void sendPingReply(MIDICable& cable) {
 	const uint8_t reply[] = {SysEx::SYSEX_START,
