@@ -119,6 +119,27 @@ void sendReply(MIDICable& cable, uint8_t command, uint8_t status) {
 	cable.sendSysex(reply, sizeof(reply));
 }
 
+// What this build of the AI SysEx protocol can do, answered to a PING so a
+// host can tell builds apart (the firmware version string is the same for
+// all of them). Older builds answer a PING with no version byte at all.
+//   1: ai-kit-automation - kit automation, row automation, kit presets
+//   2: kit/synth presets load by exact path, with their samples
+constexpr uint8_t kAIProtocolVersion = 2;
+
+void sendPingReply(MIDICable& cable) {
+	const uint8_t reply[] = {SysEx::SYSEX_START,
+	                         SysEx::DELUGE_SYSEX_ID_BYTE0,
+	                         SysEx::DELUGE_SYSEX_ID_BYTE1,
+	                         SysEx::DELUGE_SYSEX_ID_BYTE2,
+	                         SysEx::DELUGE_SYSEX_ID_BYTE3,
+	                         SysEx::SysexCommands::AI,
+	                         PING,
+	                         OK,
+	                         kAIProtocolVersion,
+	                         SysEx::SYSEX_END};
+	cable.sendSysex(reply, sizeof(reply));
+}
+
 void write21(uint8_t* out, int32_t value) {
 	if (value < 0) {
 		value = 0;
@@ -1685,8 +1706,8 @@ void AISysex::sysexReceived(MIDICable& cable, uint8_t* data, int32_t len) {
 
 	switch (command) {
 	case PING:
-		status = OK;
-		break;
+		sendPingReply(cable);
+		return;
 	case SET_CURRENT_NOTE:
 		status = setCurrentNote(data, len);
 		break;
