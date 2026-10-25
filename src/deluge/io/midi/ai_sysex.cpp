@@ -140,6 +140,18 @@ void sendPingReply(MIDICable& cable) {
 	cable.sendSysex(reply, sizeof(reply));
 }
 
+// The length of a message's text: `len` counts the SysEx end byte (0xF7)
+// too, which masked to 7 bits is 'w' - every name read up to `len` came out
+// with a stray w ("Shadow Corridorw", and kit "RIDDIM 140w", not found).
+// A name stops at the first byte with the top bit set, or at a 0.
+int32_t textEnd(uint8_t const* data, int32_t from, int32_t len) {
+	int32_t end = from;
+	while (end < len && data[end] != 0 && !(data[end] & 0x80)) {
+		end++;
+	}
+	return end;
+}
+
 void write21(uint8_t* out, int32_t value) {
 	if (value < 0) {
 		value = 0;
@@ -366,7 +378,10 @@ Status setCurrentClipName(uint8_t* data, int32_t len) {
 	}
 
 	char name[33];
-	int32_t nameLength = std::min<int32_t>(len - 2, 32);
+	int32_t nameLength = std::min<int32_t>(textEnd(data, 2, len) - 2, 32);
+	if (nameLength <= 0) {
+		return BAD_LENGTH;
+	}
 	for (int32_t i = 0; i < nameLength; i++) {
 		uint8_t c = data[i + 2] & 0x7f;
 		name[i] = (c >= 32 && c <= 126) ? (char)c : ' ';
@@ -417,7 +432,10 @@ Status loadCurrentPreset(uint8_t* data, int32_t len, OutputType outputType, char
 	}
 
 	char presetNameChars[65];
-	int32_t nameLength = std::min<int32_t>(len - 1, 64);
+	int32_t nameLength = std::min<int32_t>(textEnd(data, 1, len) - 1, 64);
+	if (nameLength <= 0) {
+		return BAD_LENGTH;
+	}
 	for (int32_t i = 0; i < nameLength; i++) {
 		uint8_t c = data[i + 1] & 0x7f;
 		presetNameChars[i] = (c >= 32 && c <= 126) ? (char)c : ' ';
@@ -1500,7 +1518,7 @@ Status setSidechain(uint8_t* data, int32_t len) {
 // else becomes '_'. Returns false for an empty or too-long name.
 bool readSongName(uint8_t* data, int32_t len, int32_t from, char* out, int32_t outSize) {
 	int32_t n = 0;
-	for (int32_t i = from; i < len && data[i] != 0; i++) {
+	for (int32_t i = from, end = textEnd(data, from, len); i < end; i++) {
 		if (n >= outSize - 1) {
 			return false;
 		}
