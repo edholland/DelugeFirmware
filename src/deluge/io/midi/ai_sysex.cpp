@@ -376,6 +376,9 @@ Status loadCurrentPreset(uint8_t* data, int32_t len, OutputType outputType, char
 	// Payload after the AI namespace command:
 	//   0: subcommand = LOAD_CURRENT_SYNTH_PRESET / LOAD_CURRENT_KIT_PRESET
 	//   1..n: ASCII preset name from SYNTHS / KITS, with or without .XML
+	// The named file and only that file: FILE_NOT_FOUND if it is not on the
+	// card (the preset browser's search would hand back the next preset in
+	// the folder instead, which is a different instrument).
 	if (len < 2) {
 		return BAD_LENGTH;
 	}
@@ -399,20 +402,11 @@ Status loadCurrentPreset(uint8_t* data, int32_t len, OutputType outputType, char
 		presetNameChars[i] = (c >= 32 && c <= 126) ? (char)c : ' ';
 	}
 	presetNameChars[nameLength] = 0;
-
-	char filename[69];
 	int32_t extensionStart = nameLength - 4;
-	bool hasXmlExtension =
-	    extensionStart >= 0 && (presetNameChars[extensionStart] == '.')
-	    && (presetNameChars[extensionStart + 1] == 'X' || presetNameChars[extensionStart + 1] == 'x')
-	    && (presetNameChars[extensionStart + 2] == 'M' || presetNameChars[extensionStart + 2] == 'm')
-	    && (presetNameChars[extensionStart + 3] == 'L' || presetNameChars[extensionStart + 3] == 'l');
-	if (hasXmlExtension) {
-		snprintf(filename, sizeof(filename), "%s", presetNameChars);
+	if (extensionStart >= 0 && presetNameChars[extensionStart] == '.'
+	    && (presetNameChars[extensionStart + 1] | 0x20) == 'x' && (presetNameChars[extensionStart + 2] | 0x20) == 'm'
+	    && (presetNameChars[extensionStart + 3] | 0x20) == 'l') {
 		presetNameChars[extensionStart] = 0;
-	}
-	else {
-		snprintf(filename, sizeof(filename), "%s.XML", presetNameChars);
 	}
 
 	Error sdError = StorageManager::initSD();
@@ -420,40 +414,38 @@ Status loadCurrentPreset(uint8_t* data, int32_t len, OutputType outputType, char
 		return SD_CARD_UNAVAILABLE;
 	}
 
-	Error error = Browser::currentDir.set(presetDir);
-	if (error != Error::NONE) {
-		return ACTION_FAILED;
-	}
-	String searchName;
-	error = searchName.set(filename);
-	if (error != Error::NONE) {
-		return ACTION_FAILED;
-	}
-	auto presetResult =
-	    loadInstrumentPresetUI.confirmPresetOrNextUnlaunchedOne(outputType, &searchName, Availability::ANY);
-	if (!presetResult) {
-		return FILE_NOT_FOUND;
-	}
-	FileItem* presetFile = presetResult.value();
-
+	String filePath;
 	String presetName;
 	String dirPath;
-	error = presetName.set(presetNameChars);
-	if (error == Error::NONE) {
-		dirPath.set(&Browser::currentDir);
-	}
-	if (error != Error::NONE) {
-		Browser::emptyFileItems();
+	if (filePath.set(presetDir) != Error::NONE || filePath.concatenate("/") != Error::NONE
+	    || filePath.concatenate(presetNameChars) != Error::NONE || filePath.concatenate(".XML") != Error::NONE
+	    || presetName.set(presetNameChars) != Error::NONE || dirPath.set(presetDir) != Error::NONE) {
 		return ACTION_FAILED;
 	}
+	FilePointer filePointer;
+	if (!StorageManager::fileExists(filePath.get(), &filePointer)) {
+		return FILE_NOT_FOUND;
+	}
 
+	Instrument* oldInstrument = (Instrument*)clip->output;
 	Instrument* newInstrument = nullptr;
-	error = StorageManager::loadInstrumentFromFile(currentSong, clip, outputType, false, &newInstrument,
-	                                               &presetFile->filePointer, &presetName, &dirPath);
-	Browser::emptyFileItems();
+	Error error = StorageManager::loadInstrumentFromFile(currentSong, clip, outputType, false, &newInstrument,
+	                                                     &filePointer, &presetName, &dirPath);
 	if (error != Error::NONE || !newInstrument) {
 		return ACTION_FAILED;
 	}
+
+	// Read the samples off the card, as the preset browser does after a load
+	// - without this a kit arrives with its rows but no audio.
+	error = newInstrument->loadAllAudioFiles(true);
+	if (error != Error::NONE) {
+		newInstrument->deleteBackedUpParamManagers(currentSong);
+		void* toDealloc = static_cast<void*>(newInstrument);
+		newInstrument->~Instrument();
+		delugeDealloc(toDealloc);
+		return ACTION_FAILED;
+	}
+	newInstrument->defaultVelocity = oldInstrument->defaultVelocity;
 
 	char modelStackMemory[MODEL_STACK_MAX_SIZE];
 	ModelStackWithTimelineCounter* modelStack = setupModelStackWithTimelineCounter(modelStackMemory, currentSong, clip);
